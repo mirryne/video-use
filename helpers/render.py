@@ -23,19 +23,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 try:
+    from .grade import get_preset, auto_grade_for_clip  # type: ignore
+except ImportError:
     from grade import get_preset, auto_grade_for_clip  # same directory
-except Exception:
-    def get_preset(name: str) -> str:
-        return ""
-
-    def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
-        return "eq=contrast=1.03:saturation=0.98", {}
 
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
@@ -65,23 +62,28 @@ def run(cmd: list[str], quiet: bool = False) -> None:
 
 
 def resolve_grade_filter(grade_field: str | None) -> str:
-    """The EDL's 'grade' field can be a preset name, a raw ffmpeg filter, or 'auto'.
+    """Resolve the EDL `grade` field to no grade, a preset, or the auto sentinel.
 
-    Returns the filter string to embed into the per-segment -vf chain.
-    For 'auto', returns the sentinel "__AUTO__" which is resolved per-segment.
+    Returns the filter string for a known preset, or "__AUTO__" for per-segment
+    analysis. Raw ffmpeg filter strings are rejected unless
+    VIDEO_USE_ALLOW_RAW_GRADE=1 is set in the environment.
     """
     if not grade_field:
         return ""
     if grade_field == "auto":
         return "__AUTO__"
-    # Preset names are short identifiers, filter strings contain '=' or ','.
-    if re.fullmatch(r"[a-zA-Z0-9_\-]+", grade_field):
-        try:
-            return get_preset(grade_field)
-        except KeyError:
-            print(f"warning: unknown preset '{grade_field}', using as raw filter")
+    try:
+        return get_preset(grade_field)
+    except KeyError:
+        if os.environ.get("VIDEO_USE_ALLOW_RAW_GRADE") == "1":
+            print(
+                "warning: VIDEO_USE_ALLOW_RAW_GRADE=1 set; using raw ffmpeg grade filter",
+                file=sys.stderr,
+            )
             return grade_field
-    return grade_field
+        raise ValueError(
+            f"unknown grade preset '{grade_field}'. Use a preset name from grade.py --list-presets, 'auto', or '' (none)."
+        ) from None
 
 
 def resolve_path(maybe_path: str, base: Path) -> Path:
@@ -205,7 +207,8 @@ def extract_all_segments(
 
     If the EDL `grade` is "auto", analyze each segment range with
     `auto_grade_for_clip` and apply a per-segment subtle correction.
-    Otherwise, apply the same preset/raw filter to every segment.
+    Otherwise, apply the same preset to every segment unless raw filters are
+    explicitly enabled via VIDEO_USE_ALLOW_RAW_GRADE=1.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
