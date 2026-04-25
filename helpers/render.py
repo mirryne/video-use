@@ -86,12 +86,64 @@ def resolve_grade_filter(grade_field: str | None) -> str:
         ) from None
 
 
-def resolve_path(maybe_path: str, base: Path) -> Path:
-    """Resolve a path that may be absolute or relative to `base`."""
+def _is_within(child: Path, parent: Path) -> bool:
+    try:
+        return child.is_relative_to(parent)
+    except AttributeError:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    try:
+        stat_result = os.lstat(path)
+    except OSError:
+        return False
+    if path.is_symlink():
+        return True
+    return os.name == "nt" and bool(getattr(stat_result, "st_file_attributes", 0) & 0x400)
+
+
+def _reject_link_components(path: Path, raw_path: Path) -> None:
+    for current in (path, *path.parents):
+        if _is_symlink_or_junction(current):
+            raise ValueError(f"path '{raw_path}' uses a symlink or junction component")
+
+
+def resolve_path(
+    maybe_path: str | Path,
+    base: Path,
+    project_root: Path | None = None,
+) -> Path:
+    """Resolve a path relative to `base` and optionally keep it within `project_root`."""
     p = Path(maybe_path)
-    if p.is_absolute():
-        return p
-    return (base / p).resolve()
+    if any(part == ".." for part in p.parts):
+        raise ValueError(f"path '{p}' contains unsupported '..' segments")
+
+    if os.name == "nt":
+        raw_path = str(p)
+        if re.match(r"^\\\\\?\\", raw_path) or any(re.match(r"^\\\\\?\\", part) for part in p.parts):
+            raise ValueError(f"path '{p}' uses unsupported Windows extended path syntax")
+        for index, part in enumerate(p.parts):
+            if ":" not in part:
+                continue
+            if index == 0 and re.fullmatch(r"[A-Za-z]:[\\/]*", part):
+                continue
+            raise ValueError(f"path '{p}' uses unsupported Windows stream syntax")
+
+    candidate = p if p.is_absolute() else base / p
+    _reject_link_components(candidate, p)
+    resolved = candidate.resolve()
+
+    if project_root is not None:
+        project_root = project_root.resolve()
+        if not _is_within(resolved, project_root):
+            raise ValueError(f"path '{p}' escapes project root '{project_root}'")
+
+    return resolved
 
 
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------
@@ -219,6 +271,7 @@ def extract_all_segments(
 
     ranges = edl["ranges"]
     sources = edl["sources"]
+    project_root = edit_dir.parent.resolve()
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
@@ -226,7 +279,7 @@ def extract_all_segments(
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
         src_name = r["source"]
-        src_path = resolve_path(sources[src_name], edit_dir)
+        src_path = resolve_path(sources[src_name], edit_dir, project_root=project_root)
         start = float(r["start"])
         end = float(r["end"])
         duration = end - start
@@ -492,6 +545,7 @@ def build_final_composite(
     """
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    project_root = edit_dir.parent.resolve()
 
     if not has_overlays and not has_subs:
         # Nothing to do — just rename/copy base to final name
@@ -500,7 +554,7 @@ def build_final_composite(
 
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
-        ov_path = resolve_path(ov["file"], edit_dir)
+        ov_path = resolve_path(ov["file"], edit_dir, project_root=project_root)
         inputs += ["-i", str(ov_path)]
 
     filter_parts: list[str] = []
@@ -523,7 +577,8 @@ def build_final_composite(
 
     # Subtitles LAST — Rule 1
     if has_subs:
-        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        subtitles_path = resolve_path(subtitles_path, edit_dir, project_root=project_root)
+        subs_abs = str(subtitles_path).replace(":", r"\:").replace("'", r"\'")
         filter_parts.append(
             f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
         )
@@ -595,7 +650,8 @@ def main() -> None:
 
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
-    out_path = args.output.resolve()
+    project_root = edit_dir.parent.resolve()
+    out_path = resolve_path(args.output, Path.cwd(), project_root=project_root)
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
@@ -619,7 +675,7 @@ def main() -> None:
             subs_path = edit_dir / "master.srt"
             build_master_srt(edl, edit_dir, subs_path)
         elif edl.get("subtitles"):
-            subs_path = resolve_path(edl["subtitles"], edit_dir)
+            subs_path = resolve_path(edl["subtitles"], edit_dir, project_root=project_root)
             if not subs_path.exists():
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
@@ -631,7 +687,11 @@ def main() -> None:
         build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
     else:
         # Composite to a temp file, then run loudnorm → final output
-        tmp_composite = out_path.with_suffix(".prenorm.mp4")
+        tmp_composite = resolve_path(
+            out_path.with_suffix(".prenorm.mp4"),
+            Path.cwd(),
+            project_root=project_root,
+        )
         build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
