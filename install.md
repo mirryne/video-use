@@ -102,28 +102,39 @@ Scribe (ElevenLabs) does all transcription. Without a key, nothing transcribes.
     grep -q '^ELEVENLABS_API_KEY=..' ~/Developer/video-use/.env 2>/dev/null && echo "dotenv"
     ```
 
-2. If neither is set, ask the user exactly once:
+2. If neither is set, tell the user exactly once:
 
-    > I need an ElevenLabs API key for transcription (word-level timestamps, speaker diarization, filler tagging). Grab one at https://elevenlabs.io/app/settings/api-keys and paste it here — I'll write it to `~/Developer/video-use/.env`. Or if you already have it exported as `ELEVENLABS_API_KEY`, say "use env" and I'll skip.
+    > I need an ElevenLabs API key for transcription (word-level timestamps, speaker diarization, filler tagging). Grab one at https://elevenlabs.io/app/settings/api-keys. Set the env var yourself in a fresh terminal (`$env:ELEVENLABS_API_KEY = '...'`) or edit `D:/dev/video-use/.env` manually before starting your agent. Never paste keys into the agent's chat.
 
-    When the user pastes a key, write it to `~/Developer/video-use/.env`:
+    If the user wants to keep the key in `.env`, the file should contain:
+
+    ```dotenv
+    ELEVENLABS_API_KEY=...
+    ```
+
+    Lock down `.env` permissions after they save it:
+
+    ```powershell
+    icacls .env /inheritance:r /grant:r "$env:USERNAME:F"
+    ```
+
+    On macOS/Linux, use:
 
     ```bash
-    printf 'ELEVENLABS_API_KEY=%s\n' "$KEY" > ~/Developer/video-use/.env
-    chmod 600 ~/Developer/video-use/.env
+    chmod 600 .env
     ```
 
     Never echo the key back in tool output. Never commit `.env`.
 
 3. Sanity check with a cheap, quota-free call:
 
-    ```bash
-    curl -s -o /dev/null -w '%{http_code}\n' \
-      -H "xi-api-key: $(sed -n 's/^ELEVENLABS_API_KEY=//p' ~/Developer/video-use/.env)" \
-      https://api.elevenlabs.io/v1/user
+    ```powershell
+    curl -s -o $null -w '%{http_code}`n' -H "xi-api-key: $env:ELEVENLABS_API_KEY" https://api.elevenlabs.io/v1/user
     ```
 
-    `200` means the key works. `401` means the user pasted a wrong/expired key — ask once more and stop. Anything else (network, 5xx), move on and verify during first real transcription.
+    If the user stored the key in `.env` instead of exporting it in the current PowerShell session, have them export it in a fresh terminal first or run the same request manually after loading the variable themselves.
+
+    `200` means the key works. `401` means the key is wrong or expired — have the user fix it locally and try again. Anything else (network, 5xx), move on and verify during first real transcription.
 
 ### 6. Verify end-to-end
 
